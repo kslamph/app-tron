@@ -639,6 +639,56 @@ bool pb_decode_trigger_smart_contract_data(pb_istream_t *stream,
 
     content->customSelector = U4BE(buf, 0);
 
+    // Known protocol methods (USDD PSM / JustLend jUSDD cToken): decode the
+    // arguments for a clear display. Matched by unique selector here; the target
+    // contract address is verified in trigger_smart_contract (only known after
+    // pb_decode returns).
+    {
+        int8_t pm = findProtocolMethodBySelector(content->customSelector);
+        if (pm >= 0) {
+            const knownContractMethod_t *m =
+                (const knownContractMethod_t *) PIC(&PROTOCOL_METHODS[pm]);
+            content->TRC20Method = 3;
+            content->decimals[0] = m->decimals;
+            content->tokenNamesLength[0] = (uint8_t) (strlen(m->token) + 1);
+            memmove(content->tokenNames[0], m->token, content->tokenNamesLength[0]);
+            memcpy(content->methodLabel, m->method, strlen(m->method) + 1);
+            if (m->labelOnly) {
+                // Complex arguments (e.g. multiClaim nested arrays): only the
+                // method/token labels are known, no amount/address to display.
+                content->destinationSize = 0;
+                return true;
+            }
+            if (m->hasAddress) {
+                // (address, uint256): 32 + 32
+                if (stream->bytes_left != 32 + 32) {
+                    return false;
+                }
+                if (!pb_read(stream, buf, 32)) {
+                    return false;
+                }
+                memcpy(content->destination, buf + (32 - 21), ADDRESS_SIZE);
+                content->destination[0] = ADD_PRE_FIX_BYTE_MAINNET;
+                content->destinationSize = ADDRESS_SIZE;
+                if (!pb_read(stream, buf, 32)) {
+                    return false;
+                }
+                memmove(content->TRC20Amount, buf, 32);
+            } else {
+                // (uint256): 32
+                if (stream->bytes_left != 32) {
+                    return false;
+                }
+                if (!pb_read(stream, buf, 32)) {
+                    return false;
+                }
+                memmove(content->TRC20Amount, buf, 32);
+                content->destinationSize = 0;
+            }
+            return true;
+        }
+    }
+
     if (memcmp(buf, SELECTOR[0], 4) == 0) {
         content->TRC20Method = 1;  // a9059cbb -> transfer(address,uint256)
     } else if (memcmp(buf, SELECTOR[1], 4) == 0) {
@@ -688,6 +738,19 @@ static bool trigger_smart_contract(txContent_t *content, pb_istream_t *stream) {
     content->amount[0] = msg.trigger_smart_contract.call_value;
     content->callTokenValue = msg.trigger_smart_contract.call_token_value;
     content->callTokenId = msg.trigger_smart_contract.token_id;
+
+    if (content->TRC20Method == 3) {
+        // Known protocol method, already decoded in pb_decode_trigger_smart_contract_data.
+        // Verify the target contract matches the expected one; otherwise fall back
+        // to the generic (raw) display.
+        int8_t pm = findProtocolMethodBySelector(content->customSelector);
+        const knownContractMethod_t *m =
+            (pm >= 0) ? (const knownContractMethod_t *) PIC(&PROTOCOL_METHODS[pm]) : NULL;
+        if (m == NULL || memcmp(content->contractAddress, m->contract, ADDRESS_SIZE) != 0) {
+            content->TRC20Method = 0;
+        }
+        return true;
+    }
 
     tokenDefinition_t *trc20 = getKnownToken(content);
 
